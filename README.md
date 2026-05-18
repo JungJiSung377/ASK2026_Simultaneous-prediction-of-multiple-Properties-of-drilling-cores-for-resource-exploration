@@ -18,7 +18,7 @@
 > 세계적인 에너지 전환에 따라 전략 광물의 수요가 급증하고 있습니다. 본 연구는 현장에서 즉각적으로 획득 가능한 **XRF 성분 데이터**와 **시각 이미지**를 결합하여, 측정에 많은 비용이 드는 물성 지표(P파 속도, 밀도, 자화율)를 예측하고 최종적으로 광물 종을 자동 분류하는 시스템을 구축하였다. 
 * **핵심 성과:** P파 속도 예측 결정계수($R^2$) **0.85** 달성, 광물 분류 정확도 **83%** 확보.
 <p align="center">
-  <img src="docs/figures/gated_residual_fusion_architecture.png" width="600" alt="Gated Residual Fusion Architecture">
+  <img src="docs/figures/gated_residual_fusion_architecture.png" width="800" alt="Gated Residual Fusion Architecture">
 </p>
 
 ---
