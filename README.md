@@ -3,7 +3,7 @@
 주제 : 자원탐사 효율화를 위한 시추 코어 광물 종 자동 분류
 
 * **저자 : 정지성, 손형오, 노예진, 최지우, 김재원, 이규원, 김영균**
-* **ACK 2026 학술 발표대회 논문집 ppooo-ooo**
+* **ACK 2026 한국정보처리학회 학술대회논문집 33권 1호 459-462(4pages)**
 
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-%23EE4C2C.svg?logo=PyTorch&logoColor=white)](https://pytorch.org/)
