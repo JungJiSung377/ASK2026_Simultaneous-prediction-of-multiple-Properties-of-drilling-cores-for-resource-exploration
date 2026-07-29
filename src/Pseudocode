@@ -1,0 +1,412 @@
+===================================================================
+1. 이미지 전처리 및 정규화 헬퍼 함수
+===================================================================
+
+FUNCTION Crop_Black_Borders(이미지, 임계값=20):
+    이미지를 배열(Numpy Array)로 변환
+    RGB 채널 평균값이 임계값(20)을 초과하는 픽셀 마스크(Mask) 생성
+
+    IF 유효한 픽셀이 하나도 없다면:
+        RETURN 원본 이미지
+
+    // 행과 열 축에서 유효한 픽셀이 존재하는 범위(Bounding Box) 탐색
+    y_최소, y_최대 = 유효한 행의 시작과 끝 인덱스
+    x_최소, x_최대 = 유효한 열의 시작과 끝 인덱스
+
+    // 검은색 배경을 제거한 영역만 자르기(Crop)하여 반환
+    RETURN 이미지.Crop(x_최소, y_최소, x_최대 + 1, y_최대 + 1)
+
+
+FUNCTION Get_Img_Transform():
+    RETURN 이미지 변환 파이프라인 (
+        1. 224x224 크기로 리사이즈 (Resize)
+        2. 텐서(Tensor) 변환 [0, 1]
+        3. ImageNet 기준 평균/표준편차로 정규화 (Normalize)
+    )
+
+
+FUNCTION Denormalize(입력_텐서):
+    ImageNet 정규화 기준값 (평균 = [0.485, 0.456, 0.406], 표준편차 = [0.229, 0.224, 0.225])
+    
+    [채널, 높이, 너비] 차원을 [높이, 너비, 채널]로 변경
+    정규화 역연산 수행: (이미지 * 표준편차) + 평균
+    값 범위를 [0.0, 1.0] 사이로 클리핑(Clip)
+    
+    RETURN 8비트 정수형 [0, 255] 이미지 배열로 변환된 데이터
+
+
+===================================================================
+2. HDF5 지질 멀티모달 데이터셋 클래스 (H5GeologyDataset)
+===================================================================
+
+CLASS H5GeologyDataset (PyTorch Dataset 상속):
+
+    METHOD Initialize(HDF5_경로, 인덱스_목록, 라벨_맵, 변환_파이프라인):
+        HDF5_경로, 인덱스_목록(64비트 정수), 라벨_맵, 변환_파이프라인 저장
+        HDF5_파일_객체 = None (멀티프로세싱 교착 방지를 위해 초기화 시점에는 열지 않음)
+
+
+    METHOD Len():
+        RETURN 인덱스_목록의 전체 개수
+
+
+    METHOD Lazy_Open():
+        // PyTorch DataLoader의 Multi-worker에서 HDF5 핸들 충돌 방지를 위한 지연 연기(Lazy Loading)
+        IF HDF5_파일_객체 == None:
+            HDF5_파일_객체 = Read 모드로 HDF5 파일 열기
+
+
+    METHOD Get_Item(index):
+        Lazy_Open() 호출 (파일 접근 확인)
+        실제_인덱스 = 인덱스_목록[index]
+
+        // [1] 이미지 데이터 추출 및 전처리
+        raw_이미지 = HDF5_파일_객체["images"][실제_인덱스]
+        IF 데이터_타입 != uint8:
+            raw_이미지 = uint8 타입으로 변환
+
+        pil_이미지 = RGB 모드의 PIL 이미지로 변환
+        pil_이미지 = Crop_Black_Borders(pil_이미지) // 검은색 여백 제거
+
+        IF 변환_파이프라인이 존재한다면:
+            최종_이미지 = 변환_파이프라인(pil_이미지)
+        ELSE:
+            최종_이미지 = ToTensor(pil_이미지)
+
+        // [2] XRF 화학 성분 데이터 추출 (Float32 Tensor)
+        xrf_성분 = Tensor(HDF5_파일_객체["xrf"][실제_인덱스])
+
+        // [3] 물리적 특성 데이터(y) 추출 (Float32 Tensor)
+        물리적_특성 = Tensor(HDF5_파일_객체["physical"][실제_인덱스])
+
+        // [4] 암종/지질 라벨 문자열 처리 및 정수 인덱스 매핑
+        raw_라벨 = HDF5_파일_객체["labels"][실제_인덱스]
+        IF bytes 타입인 경우:
+            raw_라벨 = UTF-8 문자열로 디코딩
+        
+        라벨_인덱스 = 라벨_맵.Get(raw_라벨, -1) // 맵에 없으면 -1
+        최종_라벨 = LongTensor(라벨_인덱스)
+
+        // 멀티모달 튜플 반환 (이미지, XRF성분, 물리적특성, 분류라벨)
+        RETURN 최종_이미지, xrf_성분, 물리적_특성, 최종_라벨
+
+
+    METHOD Close():
+        IF HDF5_파일_객체 != None:
+            HDF5_파일_객체 닫기
+            HDF5_파일_객체 = None
+
+===================================================================
+1. XGBoost용 멀티모달 융합 특성 추출 함수
+===================================================================
+
+FUNCTION Extract_Features_For_XGB(데이터로더, 딥러닝_모델, 계산장치):
+    딥러닝_모델 평가 모드 설정 (torch.no_grad)
+    특성_리스트, 라벨_리스트, 예측물리치_리스트, 실제물리치_리스트 초기화
+
+    FOR EACH (이미지, XRF데이터, 실제물리치, 라벨) IN 데이터로더:
+        [예측물리치, _, _, 이미지_잠재특성] = 딥러닝_모델(이미지, XRF데이터)
+        
+        // 1. 이미지 공간(높이, 너비) 기준 RGB 채널별 통계량 계산
+        RGB_평균 = 이미지의 (H, W) 축 평균   [Batch x 3]
+        RGB_표준편차 = 이미지의 (H, W) 축 표준편차 [Batch x 3]
+        
+        // 2. 고차원 멀티모달 특성 벡터 수평 결합 (Concatenation)
+        // [예측물리치(3) + 이미지_잠재특성(8) + RGB평균/표준편차(6) + 원본_XRF(N)]
+        결합_특성 = Concatenate([예측물리치, 이미지_잠재특성, RGB_평균, RGB_표준편차, XRF데이터])
+        
+        특성_리스트.Append(결합_특성)
+        라벨_리스트.Append(라벨)
+        예측물리치_리스트.Append(예측물리치)
+        실제물리치_리스트.Append(실제물리치)
+
+    RETURN 결합_특성_배열, 라벨_배열, 예측물리치_배열, 실제물리치_배열
+
+
+===================================================================
+2. 메인 파이프라인 (Main Process)
+===================================================================
+
+PROCEDURE Main():
+    Seed_Everything(42) // 재현성을 위한 난수 시드 고정
+    계산장치 설정 (GPU / CPU)
+
+    // [데이터 전처리 및 희귀 라벨 필터링]
+    HDF5 파일 로드 및 문자열 라벨 정수 매핑 테이블(LABEL_MAP) 생성
+    클래스별 샘플 수 계산 -> 10개 미만인 희귀 광물 클래스 데이터 제거
+    
+    // Stratified 3-Way Split (Train 80% / Val 10% / Test 10%)
+    학습_인덱스, 검증_인덱스, 테스트_인덱스 균등 분할
+    DataLoader 생성 (Batch Size = 32, pin_memory = True)
+
+    // -------------------------------------------------------------
+    // [Stage 1] 딥러닝 멀티모달 물리치 추론 모델 학습 (Gated Fusion)
+    // -------------------------------------------------------------
+    모델 = GatedResidualFusion(xrf_dim) 생성 및 GPU 이송
+    손실함수 = SmoothL1Loss(beta=0.05)
+    최고_R2_평균 = -Infinity
+
+    FOR Epoch = 0 TO 49:
+        // 에포크 구간별 점진적 가중치 언프리징 (Warmup -> Residual -> Finetune)
+        IF Epoch IN [0, 15, 30]:
+            옵티마이저 = Make_Optimizer(모델, 현재_단계, 학습률_설정)
+            스케줄러 = ReduceLROnPlateau(옵티마이저, patience=3)
+
+        모델.Train()
+        FOR EACH (이미지, XRF, 실제물리치, _) IN 학습_데이터로더:
+            예측물리치, 예측XRF물리치, _, _ = 모델(이미지, XRF)
+            
+            // 총 손실 = 최종 예측 손실 + 0.5 * XRF 기반 기저 예측 손실
+            총_손실 = SmoothL1Loss(예측물리치, 실제물리치) + 0.5 * SmoothL1Loss(예측XRF물리치, 실제물리치)
+            
+            역전파(Backpropagation) 및 가중치 업데이트
+
+        // 검증(Validation) 데이터셋 R2 Score 평가
+        검증_R2_평균 = Evaluate_R2_Score(val_loader, 모델)
+        
+        // 최고 성능 달성 시 최적 체크포인트 세이빙
+        IF 검증_R2_평균 > 최고_R2_평균:
+            최고_R2_평균 = 검증_R2_평균
+            최적_딥러닝_가중치 저장 ("best.pth")
+
+    PRINT "Stage 1 완료 (Best R2: ", 최고_R2_평균, ")"
+
+    // -------------------------------------------------------------
+    // [Stage 2] XGBoost 결합형 고정밀 광물 분류 모델 학습
+    // -------------------------------------------------------------
+    최적_딥러닝_가중치 ("best.pth") 로드 및 모델 평가 모드 전환
+    
+    // 1단계 딥러닝 모델로부터 XGBoost 학습/검증/테스트용 특성 데이터 추출
+    X_train, y_train = Extract_Features_For_XGB(train_loader, 모델)
+    X_val, y_val     = Extract_Features_For_XGB(val_loader, 모델)
+    X_test, y_test   = Extract_Features_For_XGB(test_loader, 모델)
+
+    // 학습 데이터와 검증 데이터 병합 (Full Train Set 구성)
+    X_train_full = Concatenate([X_train, X_val])
+    y_train_full = Concatenate([y_train, y_val])
+    
+    LabelEncoder 학습 및 정수 라벨 변환
+    클래스 불균형 해소를 위한 샘플 가중치(compute_sample_weight) 계산
+
+    // XGBoost 분류기 생성 및 학습 (n_estimators=100, max_depth=5)
+    xgb_모델 = XGBClassifier(n_estimators=100, learning_rate=0.1, max_depth=5)
+    xgb_모델.Fit(X_train_full, y_train_full_encoded, sample_weight=샘플_가중치)
+    xgb_모델 및 인코더 저장 ("xgb_best.joblib")
+
+    // 테스트 데이터셋 분류 정확도(Accuracy) 평가
+    테스트_예측 = xgb_모델.Predict(X_test)
+    최종_정확도 = Accuracy_Score(y_test, 테스트_예측)
+    PRINT "XGBoost 최종 테스트 정확도: ", 최종_정확도
+
+    // -------------------------------------------------------------
+    // [Stage 3] 사후 XAI 변수 중요도 (Feature Importance) 시각화
+    // -------------------------------------------------------------
+    특성_이름_목록 정의 ([예측_PWV, 예측_Density, 예측_MS, 이미지잠재특성(8), RGB통계량(6), XRF원본(N)])
+    
+    XGBoost Feature Importance 상위 5개 추출
+    Seaborn 막대 그래프(Barplot) 생성 및 'feature_importance.png' 이미지 저장
+
+    // 데이터셋 HDF5 파일 핸들 Close
+    train_ds.Close(); val_ds.Close(); test_ds.Close()
+    PRINT "모든 파이프라인 정상 종료"
+
+END PROCEDURE
+
+===================================================================
+1. 하위 인코더 및 예측 헤드 모듈
+===================================================================
+
+CLASS XRFEncoder:
+    METHOD Initialize(xrf_dim=23, hid=128):
+        MLP = [Linear(xrf_dim -> hid), ReLU(), Dropout(0.1), Linear(hid -> hid), ReLU()]
+
+    METHOD Forward(xrf_입력):
+        RETURN MLP(xrf_입력)
+
+
+CLASS XRFPredictor:
+    METHOD Initialize(hid=128, out_dim=3):
+        Head = [Linear(hid -> 128), ReLU(), Dropout(0.1), Linear(128 -> out_dim)]
+
+    METHOD Forward(xrf_특성):
+        RETURN Head(xrf_특성)
+
+
+CLASS ImageEncoder:
+    METHOD Initialize(out_dim=8, pretrained=True):
+        Backbone = ResNet18 (사전학습 가중치 사용)
+        Backbone의 최종 분류기(FC 레이어) 제거 (Identity 변환)
+        Proj_Head = [Linear(512 -> 8), BatchNorm1d, ReLU(), Dropout(0.1)]
+
+    METHOD Forward(이미지):
+        특성 = Backbone(이미지)
+        RETURN Proj_Head(특성)
+
+
+CLASS ImageResidualHead:
+    METHOD Initialize(in_dim=8, out_dim=3):
+        Head = [Linear(8 -> 128), ReLU(), Dropout(0.1), Linear(128 -> 3)]
+        
+        // 잔차 초기 영향을 최소화하기 위해 가중치를 정규분포(std=1e-3), 편향을 0으로 초기화
+        가중치_초기화: Normal(mean=0.0, std=0.001), 편향=0.0
+
+    METHOD Forward(이미지_특성):
+        RETURN Head(이미지_특성)
+
+
+CLASS GateNet:
+    METHOD Initialize(xrf_hid=128, img_hid=8):
+        Net = [Linear(128 + 8 -> 128), ReLU(), Dropout(0.1), Linear(128 -> 3)]
+        
+        // 핵심 이점: 마지막 레이어 편향을 -4.0으로 고정하여
+        // Sigmoid(-4.0) ≈ 0.018 초깃값을 형성 (초기 학습 시 XRF 기저 예측을 보호)
+        최종_레이어_가중치 = 0.0
+        최종_레이어_편향 = -4.0
+
+    METHOD Forward(xrf_특성, 이미지_특성):
+        결합_특성 = Concatenate([xrf_특성, 이미지_특성])
+        RETURN Sigmoid(Net(결합_특성))
+
+
+===================================================================
+2. Gated Residual Fusion 통합 네트워크
+===================================================================
+
+CLASS GatedResidualFusion:
+
+    METHOD Initialize(xrf_dim=23):
+        xrf_enc   = XRFEncoder(xrf_dim)
+        xrf_pred  = XRFPredictor()
+        img_enc   = ImageEncoder()
+        img_delta = ImageResidualHead()
+        gate      = GateNet()
+
+
+    METHOD Forward(이미지, xrf):
+        // [1] XRF 화학 데이터 기반 기저 물리치 예측
+        xrf_특성 = xrf_enc(xrf)
+        기저_예측 = xrf_pred(xrf_특성)
+
+        // [2] 이미지 기반 잔차(Delta) 추론
+        이미지_특성 = img_enc(이미지)
+        잔차_보정치 = img_delta(이미지_특성)
+
+        // [3] 동적 게이팅 가중치 계산 (0.0 ~ 1.0 범위)
+        게이트_가중치 = gate(xrf_특성, 이미지_특성)
+
+        // [4] 융합 예측: 기저_예측 + (게이트_가중치 * 잔차_보정치)
+        최종_예측 = 기저_예측 + (게이트_가중치 * 잔차_보정치)
+        최종_예측 = Clamp(최종_예측, 0.0, 1.0) // [0.0, 1.0] 범위 제약
+
+        RETURN 최종_예측, 기저_예측, 게이트_가중치, 이미지_특성
+
+
+===================================================================
+3. GradCAM (Gradient-weighted Class Activation Mapping) 시각화
+===================================================================
+
+CLASS GradCAM:
+
+    METHOD Initialize(모델, 타겟_레이어):
+        타겟_레이어에 Forward 및 Backward 훅(Hook) 등록
+
+
+    METHOD Generate_CAM(결합_특성, 클래스_확률, 클래스_인덱스, 입력_크기):
+        모델 기울기 초기화
+        타겟_값 = (결합_특성 * 가우시안_노이즈)의 합 * 클래스_확률[클래스_인덱스]
+        타겟_값에 대해 역전파(Backward) 수행
+        
+        기울기(Gradients) 및 활성화맵(Activations) 추출
+        
+        // 채널별 기울기의 공간 평균(Global Average Pooling)으로 채널 가중치 도출
+        채널_가중치 = Mean(기울기, axis=(높이, 너비))
+        
+        CAM = sum(채널_가중치[i] * 활성화맵[i])
+        CAM = ReLU(CAM) // 양의 기여를 하는 특성만 남김
+        
+        입력 이미지 크기로 Resize 수행
+        [0, 1] 범위로 Min-Max 정규화
+        RETURN CAM
+
+===================================================================
+1. 시드 고정 및 성능 평가 헬퍼 함수
+===================================================================
+
+FUNCTION Seed_Everything(시드값=42):
+    Python random, NumPy, PyTorch CPU/GPU 난수 시드 고정
+    환경변수 "PYTHONHASHSEED" 고정
+    -> 실험 재현성(Reproducibility) 확보
+
+
+FUNCTION Eval_Metrics(예측값, 실제값, 클리핑여부=True):
+    IF 클리핑여부 == True:
+        예측값 = Clamp(예측값, 0.0, 1.0) // [0, 1] 물리적 범위 제약
+
+    3개 타겟 물리 특성(PWV, Density, MS) 각각에 대해:
+        R2_Score (결정계수) 리스트 계산
+        MAE (평균 절대 오차) 리스트 계산
+        RMSE (평균 제곱근 오차) 리스트 계산
+
+    RETURN R2_리스트, MAE_리스트, RMSE_리스트
+
+
+FUNCTION Interpret_Confidence(확률값):
+    IF 확률값 > 0.9:  RETURN "Very High"
+    IF 확률값 > 0.7:  RETURN "High"
+    RETURN "Low"
+
+
+===================================================================
+2. 학습 단계별 파라미터 동적 제어 및 옵티마이저 생성 모듈
+===================================================================
+
+FUNCTION Set_Requires_Grad(모듈, 경사도_추적_여부):
+    모듈 내 모든 파라미터의 requires_grad 속성을 설정
+    (True = 가중치 업데이트 수행 / False = 파라미터 동결 Freezing)
+
+
+FUNCTION Make_Optimizer(모델, 학습_단계, 학습률_설정):
+    파라미터_그룹 = []
+    가중치_감쇠(Weight Decay) = 학습률_설정["WEIGHT_DECAY"]
+
+    // -------------------------------------------------------------
+    // [Stage 1: Warmup] XRF 기저 모델 우선 학습
+    // -------------------------------------------------------------
+    IF 학습_단계 == "warmup":
+        // XRF 인코더 및 예측 헤드만 활성화, 이미지/게이트 관련 모듈 동결
+        Set_Requires_Grad(모델.xrf_enc, True)
+        Set_Requires_Grad(모델.xrf_pred, True)
+        Set_Requires_Grad(모델.img_enc, False)
+        Set_Requires_Grad(모델.img_delta, False)
+        Set_Requires_Grad(모델.gate, False)
+
+        파라미터_그룹에 (모델.xrf_enc, 학습률 = LR_XRF) 추가
+        파라미터_그룹에 (모델.xrf_pred, 학습률 = LR_XRF) 추가
+
+    // -------------------------------------------------------------
+    // [Stage 2: Residual] 이미지 잔차(Delta) 및 동적 게이트 학습
+    // -------------------------------------------------------------
+    ELSE IF 학습_단계 == "residual":
+        // 이미지 인코더, 잔차 헤드, 게이트, XRF 인코더 활성화 (XRF 예측 헤드는 동결)
+        Set_Requires_Grad(모델.img_enc, True)
+        Set_Requires_Grad(모델.img_delta, True)
+        Set_Requires_Grad(모델.gate, True)
+        Set_Requires_Grad(모델.xrf_enc, True)
+        Set_Requires_Grad(모델.xrf_pred, False)
+
+        파라미터_그룹에 (모델.img_enc, 학습률 = LR_IMG) 추가
+        파라미터_그룹에 (모델.img_delta, 학습률 = LR_IMG) 추가
+        파라미터_그룹에 (모델.gate, 학습률 = LR_GATE) 추가
+        파라미터_그룹에 (모델.xrf_enc, 학습률 = LR_XRF) 추가
+
+    // -------------------------------------------------------------
+    // [Stage 3: Finetune] 전체 네트워크 미세 조정 (End-to-End)
+    // -------------------------------------------------------------
+    ELSE: // "finetune"
+        // 모든 하위 네트워크 파라미터 언프리징 (Unfreeze)
+        Set_Requires_Grad(전체 파라미터, True)
+
+        파라미터_그룹에 (전체 파라미터, 학습률 = LR_ALL) 추가
+
+    // 설정된 파라미터 그룹과 가중치 감쇠 기반 AdamW 옵티마이저 생성 및 반환
+    RETURN AdamW(파라미터_그룹)
